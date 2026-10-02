@@ -1,4 +1,4 @@
-"""Request schemas and validation for the audit API."""
+"""Request schemas and validation for the audit and review API."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 AUDIT_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
 RULE_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
 MAX_RULES = 18
+MAX_CONSTRAINTS = 6
 PORT_MIN = 0
 PORT_MAX = 65535
 
@@ -70,3 +71,20 @@ class AuditRequest(BaseModel):
         if duplicates:
             raise ValueError(f"规则标识重复: {', '.join(duplicates)}")
         return self
+
+
+class OrderConstraint(BaseModel):
+    """Release constraint: ``before`` must be published earlier than ``after``."""
+
+    before: str = Field(pattern=RULE_ID_PATTERN)
+    after: str = Field(pattern=RULE_ID_PATTERN)
+
+
+class ReviewRequest(BaseModel):
+    """Reopen a frozen audit under at most six release-order constraints."""
+
+    review_id: str = Field(pattern=AUDIT_ID_PATTERN)
+    source_audit_id: str = Field(pattern=AUDIT_ID_PATTERN)
+    constraints: list[OrderConstraint] = Field(
+        default_factory=list, max_length=MAX_CONSTRAINTS
+    )

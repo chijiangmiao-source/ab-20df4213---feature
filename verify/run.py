@@ -2,10 +2,13 @@
 
 Runs, in order:
   1. build check   — byte-compile every shipped Python module
-  2. code tests    — the pytest suite (region algebra, engine, API)
+  2. code tests    — the pytest suite (region algebra, engine, robustness,
+                     API lifecycle and rejection paths)
   3. HTTP smoke    — against the live service: one partially shadowed rule,
                      one fully shadowed rule, and an illegal retransmission
-                     (same audit id, different payload)
+                     (same audit id, different payload); plus the review
+                     API: robust conclusion, counterexample order, cycle
+                     rejection and source audit regression
 
 Exits 0 only if every step passes; the Compose ``verify`` service surfaces
 this as its container exit code.
@@ -157,6 +160,112 @@ def smoke() -> None:
     status, page = http("GET", "/")
     assert status == 200 and "规则隔离审计" in page, "页面不可用"
     log("  ✓ 页面与健康端点可用")
+
+    review_smoke(audit_id, rules)
+
+
+def review_smoke(source_audit_id, rules):
+    """HTTP smoke for the release-order robustness review API."""
+    import time as _time
+
+    rid_base = f"review-{int(_time.time())}"
+
+    # 1) Robust conclusion: force the narrow rules r2 and r3 before the
+    # broad rule r1; every compatible order keeps each rule hittable.
+    robust_id = rid_base + "-ok"
+    body = {
+        "review_id": robust_id,
+        "source_audit_id": source_audit_id,
+        "constraints": [
+            {"before": "r2", "after": "r1"},
+            {"before": "r3", "after": "r1"},
+        ],
+    }
+    status, resp = http("POST", "/api/reviews", body)
+    assert status == 201, f"稳健复核创建失败: HTTP {status} {resp}"
+    assert resp["robust"] is True and resp["counterexample"] is None, (
+        f"稳健结论错误: {resp}"
+    )
+    assert resp["source"]["rules"] == rules, "复核快照未冻结来源规则"
+    log("  ✓ 稳健结论正确且来源规则已随复核冻结")
+
+    # Reopening returns the identical frozen review.
+    status, reopened = http("GET", f"/api/reviews/{robust_id}")
+    assert status == 200 and reopened == resp, "重开复核得到的结论不一致"
+    # Idempotent replay.
+    status, replay = http("POST", "/api/reviews", body)
+    assert status == 200 and replay == resp, f"复核幂等重放失败: HTTP {status}"
+
+    # 2) Counterexample order with no constraints.
+    bad_id = rid_base + "-bad"
+    status, resp = http("POST", "/api/reviews", {
+        "review_id": bad_id, "source_audit_id": source_audit_id, "constraints": [],
+    })
+    assert status == 201, f"反例复核创建失败: HTTP {status} {resp}"
+    assert resp["robust"] is False, "无约束时应存在遮蔽顺序"
+    ce = resp["counterexample"]
+    assert ce is not None, "不稳健时必须给出完整反例顺序"
+    assert len(ce["order"]) == len(rules) == 3
+    assert set(ce["order"]) == {"r1", "r2", "r3"}, f"反例不是完整顺序: {ce['order']}"
+    assert ce["order"][ce["position"]] == ce["shadowed_rule"], "位置与被遮蔽规则不一致"
+    assert ce["shadowed_rule"] not in ce["covered_by"], "覆盖者不应包含被遮蔽规则自身"
+    assert all(ce["order"].index(c) < ce["position"] for c in ce["covered_by"]), (
+        "覆盖者必须位于被遮蔽规则之前"
+    )
+    log(f"  ✓ 反例顺序正确：{' → '.join(ce['order'])}，{ce['shadowed_rule']} 被遮蔽")
+
+    # 3) Ordering cycle is rejected (422) and leaves no review record;
+    # also cover unknown-rule / self / duplicate rejections.
+    for name, constraints in [
+        ("cycle", [{"before": "r1", "after": "r2"},
+                   {"before": "r2", "after": "r3"},
+                   {"before": "r3", "after": "r1"}]),
+        ("unknown", [{"before": "r1", "after": "rx"}]),
+        ("self", [{"before": "r2", "after": "r2"}]),
+        ("duplicate", [{"before": "r1", "after": "r2"},
+                       {"before": "r1", "after": "r2"}]),
+    ]:
+        rej_id = rid_base + "-" + name
+        status, resp = http("POST", "/api/reviews", {
+            "review_id": rej_id,
+            "source_audit_id": source_audit_id,
+            "constraints": constraints,
+        })
+        assert status == 422, f"{name} 约束未被拒绝: HTTP {status} {resp}"
+        status, _ = http("GET", f"/api/reviews/{rej_id}")
+        assert status == 404, f"{name} 拒绝不应留下复核记录"
+    log("  ✓ 先后环 / 未知规则 / 自约束 / 重复约束均拒绝（422）且不留痕")
+
+    # Unknown source audit is rejected as well.
+    status, resp = http("POST", "/api/reviews", {
+        "review_id": rid_base + "-nosrc",
+        "source_audit_id": "no-such-audit",
+        "constraints": [],
+    })
+    assert status == 422, f"来源不存在未被拒绝: HTTP {status}"
+    log("  ✓ 来源审计不存在被拒绝（422）")
+
+    # 4) Same review id with changed constraints -> 409, original kept.
+    status, conflict = http("POST", "/api/reviews", {
+        "review_id": robust_id,
+        "source_audit_id": source_audit_id,
+        "constraints": [{"before": "r3", "after": "r1"}],
+    })
+    assert status == 409, f"改换约束未被拒绝: HTTP {status} {conflict}"
+    status, kept = http("GET", f"/api/reviews/{robust_id}")
+    assert status == 200 and kept["constraints"] == [["r2", "r1"], ["r3", "r1"]], (
+        "冲突请求改写了既有冻结复核"
+    )
+    log("  ✓ 同标识改换约束被拒绝（409）且既有复核未被改写")
+
+    # Source audit regression: original per-rule verdicts remain
+    # available by audit id and inside the review snapshot.
+    status, frozen_audit = http("GET", f"/api/audits/{source_audit_id}")
+    assert status == 200, "来源审计裁决仍须可按标识查看"
+    assert frozen_audit["verdicts"] == reopened["source"]["verdicts"], (
+        "复核快照中的逐规则裁决与来源审计不一致"
+    )
+    log("  ✓ 来源审计逐规则裁决仍可按标识查看（来源回归）")
 
 
 def main() -> int:
