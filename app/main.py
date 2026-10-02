@@ -9,14 +9,16 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 
 from .engine import analyze
-from .schemas import AuditRequest
-from .store import AuditStore, fingerprint, new_record
+from .review import solve_review
+from .schemas import AuditRequest, ReviewRequest, Rule
+from .store import AuditStore, ReviewStore, fingerprint, new_record, new_review_record
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
 app = FastAPI(title="飞行数据链路规则隔离审计", version="1.0.0")
 store = AuditStore()
+review_store = ReviewStore()
 
 
 @app.exception_handler(RequestValidationError)
@@ -81,6 +83,83 @@ def get_audit(audit_id: str):
     return record.response()
 
 
+@app.post("/api/reviews", status_code=201)
+def create_review(req: ReviewRequest):
+    """Freeze a publish-order robustness review over a frozen audit.
+
+    The source audit must already exist; its rules and the constraints
+    are frozen into the review.  Replaying the identical payload under
+    the same review id returns the existing conclusion (200); the same
+    review id with a different source or different constraints is
+    rejected (409) and never rewrites the stored conclusion.
+    """
+    payload = req.model_dump(mode="json")
+    digest = fingerprint(payload)
+
+    existing = review_store.get(req.review_id)
+    if existing is not None:
+        if existing.digest == digest:
+            return JSONResponse(status_code=200, content=existing.response())
+        raise HTTPException(
+            status_code=409, detail=_review_conflict_detail(req.review_id)
+        )
+
+    audit = store.get(req.audit_id)
+    if audit is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "audit_not_found",
+                "message": f"来源审计 {req.audit_id!r} 不存在，无法复核。",
+                "audit_id": req.audit_id,
+            },
+        )
+
+    known_ids = {rule["id"] for rule in audit.rules}
+    referenced = {c.before for c in req.constraints} | {
+        c.after for c in req.constraints
+    }
+    unknown = sorted(referenced - known_ids)
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "unknown_rules",
+                "message": (
+                    f"约束引用了来源审计中不存在的规则: {', '.join(unknown)}"
+                ),
+                "unknown_rules": unknown,
+            },
+        )
+
+    rules = [Rule.model_validate(rule) for rule in audit.rules]
+    result = solve_review(rules, req.constraints)
+    record = new_review_record(req.review_id, payload, audit.rules, result)
+    winner = review_store.put_if_absent(record)
+    if winner.digest != digest:
+        raise HTTPException(
+            status_code=409, detail=_review_conflict_detail(req.review_id)
+        )
+    status_code = 201 if winner is record else 200
+    return JSONResponse(status_code=status_code, content=winner.response())
+
+
+@app.get("/api/reviews/{review_id}")
+def get_review(review_id: str):
+    """Return the frozen conclusion for a review identifier."""
+    record = review_store.get(review_id)
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "review_not_found",
+                "message": f"复核标识 {review_id!r} 不存在。",
+                "review_id": review_id,
+            },
+        )
+    return record.response()
+
+
 @app.get("/", include_in_schema=False)
 def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
@@ -94,4 +173,15 @@ def _conflict_detail(audit_id: str) -> dict:
             "既有结论已冻结，拒绝改写。"
         ),
         "audit_id": audit_id,
+    }
+
+
+def _review_conflict_detail(review_id: str) -> dict:
+    return {
+        "error": "review_id_conflict",
+        "message": (
+            f"复核标识 {review_id!r} 已存在且来源或约束不同；"
+            "既有结论已冻结，拒绝改写。"
+        ),
+        "review_id": review_id,
     }

@@ -32,6 +32,11 @@ button:disabled{opacity:.5;cursor:default}
 .tag{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap}
 .tag.hit{background:rgba(46,160,67,.15);color:var(--hit);border:1px solid rgba(46,160,67,.45)}
 .tag.shadowed{background:rgba(214,69,69,.15);color:var(--shadow);border:1px solid rgba(214,69,69,.45)}
+.banner{padding:10px 14px;border-radius:8px;font-weight:700;font-size:14px;margin:10px 0}
+.banner.robust{background:rgba(46,160,67,.15);color:var(--hit);border:1px solid rgba(46,160,67,.45)}
+.banner.notrobust{background:rgba(214,69,69,.15);color:var(--shadow);border:1px solid rgba(214,69,69,.45)}
+.orderchip{display:inline-block;background:#0d141d;border:1px solid var(--accent);border-radius:6px;padding:2px 8px;margin:2px 4px 2px 0;font-family:ui-monospace,Consolas,monospace;font-size:12px}
+select.csel{width:200px}
 .chip{display:inline-block;background:#0d141d;border:1px solid var(--line);border-radius:6px;padding:1px 8px;margin:1px 3px 1px 0;font-family:ui-monospace,Consolas,monospace;font-size:12px}
 .mono{font-family:ui-monospace,Consolas,monospace}
 #error{background:rgba(214,69,69,.12);border:1px solid rgba(214,69,69,.5);color:#ffb4b4;white-space:pre-wrap;font-size:13px;line-height:1.6}
@@ -47,6 +52,8 @@ button:disabled{opacity:.5;cursor:default}
   <p>上线前按优先级逐条核对报文规则：仍可命中的规则给出按「协议 → 源地址 → 目的地址 → 源端口 → 目的端口」字典序的最小报文见证；
      被更早规则完全遮蔽的规则给出覆盖它的更早规则标识集合。判定基于协议 × 源 IPv4 × 目的 IPv4 × 源端口 × 目的端口的五维精确区域运算，
      不抽样地址、不枚举端口。</p>
+  <p>对已冻结的审计还可提交<strong>发布顺序复核</strong>：给定至多 6 组「规则甲必须早于规则乙」的发布约束，系统枚举约束允许的优先级前缀状态，
+     判定是否任意满足约束的发布顺序都能让每条规则保有首先命中的报文；若不稳健，则给出导致遮蔽的完整反例顺序、被遮蔽规则与覆盖依据。</p>
 </header>
 <main>
   <section>
@@ -82,7 +89,50 @@ button:disabled{opacity:.5;cursor:default}
     <div class="note">结论一经提交即冻结：同一标识再次提交不同载荷会被拒绝（HTTP 409），不会改写既有结论。</div>
   </section>
 
+  <section>
+    <h2>3. 提交发布顺序复核（至多 6 组「必须早于」约束）</h2>
+    <div class="row">
+      <label class="field">复核标识（稳定、可重开；同标识改换来源或约束将被拒绝）
+        <input id="reviewId" class="mono" placeholder="例如 review-2026-09-29" maxlength="64">
+      </label>
+      <label class="field">来源审计标识（须为已冻结的审计）
+        <input id="reviewAuditId" class="mono" placeholder="第 1 节提交的审计标识" maxlength="64">
+      </label>
+      <button class="ghost" id="loadSrcBtn" type="button">载入来源规则</button>
+    </div>
+    <div class="note" id="srcNote">载入来源审计的规则后，即可为每组约束选择「规则甲必须早于规则乙」。</div>
+    <table style="margin-top:10px">
+      <thead><tr>
+        <th>#</th><th>规则甲（必须更早发布）</th><th>规则乙（必须更晚发布）</th><th></th>
+      </tr></thead>
+      <tbody id="constraintRows"></tbody>
+    </table>
+    <div class="toolbar">
+      <button class="ghost" id="addConstraintBtn" type="button">＋ 添加约束</button>
+      <button id="reviewSubmitBtn" type="button">提交复核</button>
+      <span class="note" id="constraintNote"></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>4. 按复核标识重开复核结论</h2>
+    <div class="row">
+      <label class="field">复核标识
+        <input id="reviewLookupId" class="mono" placeholder="提交时使用的复核标识" maxlength="64">
+      </label>
+      <button class="ghost" id="reviewLookupBtn" type="button">重开复核结论</button>
+    </div>
+    <div class="note">复核结论一经提交即冻结：同一复核标识改换来源审计或约束会被拒绝（HTTP 409），不会改写既有结论；同载荷重传返回原结论。</div>
+  </section>
+
   <section id="error" hidden></section>
+
+  <section id="reviewResult" hidden>
+    <h2>复核结论 <span class="mono" id="reviewResultId"></span></h2>
+    <div class="note" id="reviewMeta"></div>
+    <div id="reviewBanner"></div>
+    <div id="reviewDetail"></div>
+  </section>
 
   <section id="result" hidden>
     <h2>逐规则结论 <span class="mono" id="resultAudit"></span></h2>
@@ -100,8 +150,11 @@ button:disabled{opacity:.5;cursor:default}
 <script>
 "use strict";
 const MAX_RULES = 18;
+const MAX_CONSTRAINTS = 6;
 const rowsEl = document.getElementById('ruleRows');
+const constraintRowsEl = document.getElementById('constraintRows');
 const PROTO_LABEL = {tcp: 'TCP', udp: 'UDP', both: 'TCP+UDP'};
+let srcRuleIds = [];
 
 const esc = s => String(s).replace(/[&<>"']/g,
   c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -206,6 +259,8 @@ function renderResult(data, note) {
   const sec = document.getElementById('result');
   sec.hidden = false;
   sec.scrollIntoView({behavior: 'smooth'});
+  const srcInput = document.getElementById('reviewAuditId');
+  if (!srcInput.value.trim()) srcInput.value = data.audit_id;
 }
 
 async function submitAudit() {
@@ -245,6 +300,136 @@ async function lookupAudit() {
   }
 }
 
+async function loadSourceRules() {
+  clearError();
+  const id = document.getElementById('reviewAuditId').value.trim();
+  if (!id) { showError('请输入来源审计标识。'); return; }
+  try {
+    const resp = await fetch('/api/audits/' + encodeURIComponent(id));
+    const data = await resp.json();
+    if (!resp.ok) { showError(formatError(resp.status, data)); return; }
+    srcRuleIds = data.rules.map(r => r.id);
+    constraintRowsEl.innerHTML = '';
+    renumberConstraints();
+    document.getElementById('srcNote').innerHTML =
+      '来源审计 <span class="chip">' + esc(data.audit_id) + '</span> 的规则：' +
+      srcRuleIds.map(rid => '<span class="chip">' + esc(rid) + '</span>').join('');
+  } catch (e) {
+    showError('请求失败：' + e);
+  }
+}
+
+function addConstraintRow() {
+  if (!srcRuleIds.length) { showError('请先载入来源审计规则。'); return; }
+  if (constraintRowsEl.children.length >= MAX_CONSTRAINTS) {
+    showError('至多 ' + MAX_CONSTRAINTS + ' 组约束。');
+    return;
+  }
+  const options = srcRuleIds.map(rid => '<option value="' + esc(rid) + '">' + esc(rid) + '</option>').join('');
+  const tr = document.createElement('tr');
+  tr.innerHTML =
+    '<td class="idx mono"></td>' +
+    '<td><select class="csel before"><option value="">— 选择规则甲 —</option>' + options + '</select></td>' +
+    '<td><select class="csel after"><option value="">— 选择规则乙 —</option>' + options + '</select></td>' +
+    '<td><button class="del" type="button" title="删除该约束">✕</button></td>';
+  tr.querySelector('.del').addEventListener('click', () => { tr.remove(); renumberConstraints(); });
+  constraintRowsEl.appendChild(tr);
+  renumberConstraints();
+}
+
+function renumberConstraints() {
+  [...constraintRowsEl.children].forEach((tr, i) => { tr.querySelector('.idx').textContent = i + 1; });
+  document.getElementById('constraintNote').textContent =
+    '已录入 ' + constraintRowsEl.children.length + ' / ' + MAX_CONSTRAINTS + ' 组约束';
+}
+
+function collectConstraints() {
+  const out = [];
+  for (const tr of constraintRowsEl.children) {
+    const before = tr.querySelector('.before').value;
+    const after = tr.querySelector('.after').value;
+    if (!before || !after) { showError('每组约束都需选择规则甲与规则乙。'); return null; }
+    out.push({before, after});
+  }
+  return out;
+}
+
+function renderReview(data, note) {
+  document.getElementById('reviewResultId').textContent = '—— ' + data.review_id;
+  const cons = data.constraints.length
+    ? data.constraints.map(c => '<span class="chip">' + esc(c.before) + ' ≺ ' + esc(c.after) + '</span>').join('')
+    : '<span class="note">（无约束）</span>';
+  document.getElementById('reviewMeta').innerHTML =
+    (note ? esc(note) + '　' : '') +
+    '来源审计 <span class="chip">' + esc(data.audit_id) + '</span>　约束 ' + cons +
+    '　枚举的优先级前缀状态数 ' + data.states_explored + '　结论冻结时间：' + esc(data.created_at);
+  const banner = document.getElementById('reviewBanner');
+  const detail = document.getElementById('reviewDetail');
+  if (data.status === 'robust') {
+    banner.innerHTML = '<div class="banner robust">稳健：任意满足约束的发布顺序中，每条规则都保有首先命中的报文。</div>';
+    detail.innerHTML = '';
+  } else {
+    const ce = data.counterexample;
+    banner.innerHTML = '<div class="banner notrobust">不稳健：存在满足约束的发布顺序，使规则被更早规则完全遮蔽。</div>';
+    const order = ce.order.map((id, i) =>
+      '<span class="orderchip">' + (i + 1) + '. ' + esc(id) + '</span>').join(' → ');
+    detail.innerHTML =
+      '<table><tbody>' +
+      '<tr><th>导致遮蔽的发布顺序</th><td>' + order + '</td></tr>' +
+      '<tr><th>被遮蔽规则</th><td><span class="chip">' + esc(ce.shadowed_rule) + '</span></td></tr>' +
+      '<tr><th>覆盖它的更早规则</th><td>' +
+        ce.covered_by.map(id => '<span class="chip">' + esc(id) + '</span>').join('') +
+      '</td></tr>' +
+      '</tbody></table>';
+  }
+  const sec = document.getElementById('reviewResult');
+  sec.hidden = false;
+  sec.scrollIntoView({behavior: 'smooth'});
+}
+
+async function submitReview() {
+  clearError();
+  const constraints = collectConstraints();
+  if (constraints === null) return;
+  const body = {
+    review_id: document.getElementById('reviewId').value.trim(),
+    audit_id: document.getElementById('reviewAuditId').value.trim(),
+    constraints,
+  };
+  const btn = document.getElementById('reviewSubmitBtn');
+  btn.disabled = true;
+  try {
+    const resp = await fetch('/api/reviews', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (!resp.ok) { showError(formatError(resp.status, data)); return; }
+    renderReview(data, resp.status === 200
+      ? '该复核标识已存在且载荷一致，以下为既有冻结结论（幂等重放）。'
+      : '复核已创建，结论已冻结。');
+  } catch (e) {
+    showError('请求失败：' + e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function lookupReview() {
+  clearError();
+  const id = document.getElementById('reviewLookupId').value.trim();
+  if (!id) { showError('请输入复核标识。'); return; }
+  try {
+    const resp = await fetch('/api/reviews/' + encodeURIComponent(id));
+    const data = await resp.json();
+    if (!resp.ok) { showError(formatError(resp.status, data)); return; }
+    renderReview(data, '以下为该复核标识对应的冻结结论。');
+  } catch (e) {
+    showError('请求失败：' + e);
+  }
+}
+
 function fillExample() {
   rowsEl.innerHTML = '';
   document.getElementById('auditId').value = 'audit-' + new Date().toISOString().slice(0, 10);
@@ -260,6 +445,10 @@ document.getElementById('addBtn').addEventListener('click', () => addRow());
 document.getElementById('exampleBtn').addEventListener('click', fillExample);
 document.getElementById('submitBtn').addEventListener('click', submitAudit);
 document.getElementById('lookupBtn').addEventListener('click', lookupAudit);
+document.getElementById('loadSrcBtn').addEventListener('click', loadSourceRules);
+document.getElementById('addConstraintBtn').addEventListener('click', addConstraintRow);
+document.getElementById('reviewSubmitBtn').addEventListener('click', submitReview);
+document.getElementById('reviewLookupBtn').addEventListener('click', lookupReview);
 addRow();
 </script>
 </body>
